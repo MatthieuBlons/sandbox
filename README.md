@@ -1,2 +1,3 @@
-# toolkit_cbio
-Tool packages developed at the CBIO lab for Whole Slide Images analysis.
+# SANDBOX
+Tools developed:
+  - at the CBIO lab for Whole Slide Images analysis.
