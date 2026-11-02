@@ -1,0 +1,805 @@
+import traceback
+from abc import abstractmethod
+import torch
+import os
+from torchinfo import summary as model_summary
+from slide.utils import get_weights_path, get_model_path
+import timm
+from functools import partial
+
+"""
+For the most part this file is a fork of https://github.com/mahmoodlab/TRIDENT/blob/main/trident/patch_encoder_models/load.py 
+It contains an assortment of pretrained patch encoders, all loadable via the encoder_factory() function.
+"""
+
+
+def get_encoder_mapping():
+    """
+    Get encoder mapping dictionary which maps encoder name to encoder class.
+
+    Returns:
+        dict: mapping of encoder name to encoder class.
+    """
+
+    encoder_mapping = {
+        "resnet50": ResNet50InferenceEncoder,
+        "ctranspath": CTransPathInferenceEncoder,
+        "prov_gigapath": GigaPathInferenceEncoder,
+        "uni_v1": UNIInferenceEncoder,
+        "uni_v2": UNIv2InferenceEncoder,
+        "univ2_seal_vision": partial(SealVisionInferenceEncoder, backbone="univ2"),
+        "conch_v1": Conchv1InferenceEncoder,
+        "conch_v15": Conchv15InferenceEncoder,
+        "conch_seal_vision": partial(SealVisionInferenceEncoder, backbone="conch"),
+        "hoptimus0": HOptimus0InferenceEncoder,
+        "h0mini": H0MiniInferenceEncoder,
+        "hoptimus1": HOptimus1InferenceEncoder,
+        "PROiFHESi_H1": PROiFHESiH1InferenceEncoder,
+        "virchow": VirchowInferenceEncoder,
+        "virchow2": Virchow2InferenceEncoder,
+        "phikon": PhikonInferenceEncoder,
+        "phikon_v2": Phikonv2InferenceEncoder,
+        "musk": MuskInferenceEncoder,
+    }
+
+    return encoder_mapping
+
+
+def encoder_factory(model_name, **kwargs):
+    """
+    Build a patch encoder model.
+
+    Args:
+        model_name (str): The name of the model to build.
+        **kwargs: Additional arguments to pass to the encoder constructor.
+
+    Returns:
+        torch.nn.Module: The patch encoder model.
+    """
+
+    # Retrieving encoder mapping dict
+    encoder_mapping = get_encoder_mapping()
+
+    if model_name in encoder_mapping.keys():
+        return encoder_mapping[model_name](**kwargs)
+    else:
+        raise ValueError(f"Unknown encoder name {model_name}")
+
+
+####################################################################################################
+
+
+class BasePatchEncoder(torch.nn.Module):
+
+    def __init__(self, **build_kwargs):
+        super().__init__()
+        self.enc_name = None
+        self.model, self.eval_transforms, self.precision = self._build(**build_kwargs)
+
+    def forward(self, x):
+        """
+        Can be overwritten if model requires special forward pass.
+        """
+        z = self.model(x)
+        return z
+
+    def forward_features(self, x):
+        z = self.model.forward_features(x)
+        return z
+
+    def print_summary(self, depth=4, verbose=0):
+        model_summary(self.model, depth=depth, verbose=verbose)
+
+    @abstractmethod
+    def _build(self, **build_kwargs):
+        pass
+
+
+class CustomInferenceEncoder(BasePatchEncoder):
+    def __init__(self, enc_name, model, transforms, precision, **kwargs):
+        super().__init__()
+        self.enc_name = enc_name
+        self.model = model
+        self.eval_transforms = transforms
+        self.precision = precision
+
+    def _build(self):
+        return None, None, None
+
+
+class ResNet50InferenceEncoder(BasePatchEncoder):
+    def _build(
+        self,
+        pretrained=True,
+        timm_kwargs={"features_only": True, "out_indices": [3], "num_classes": 0},
+        image_size=224,
+        pool=True,
+        **kwargs,
+    ):
+        import timm
+        from torchvision.transforms import Compose, Resize, InterpolationMode
+
+        self.enc_name = "resnet50"
+        model = timm.create_model(
+            "resnet50.tv_in1k", pretrained=pretrained, **timm_kwargs
+        )
+        eval_transform = get_eval_transforms(
+            (0.485, 0.456, 0.406),
+            (0.229, 0.224, 0.225),
+            target_img_size=image_size,
+            interpolation=InterpolationMode.BILINEAR,
+            max_size=None,
+            antialias=True,
+        )
+
+        precision = torch.float32
+        if pool:
+            self.pool = torch.nn.AdaptiveAvgPool2d(1)
+        else:
+            self.pool = None
+
+        return model, eval_transform, precision
+
+    def forward(self, x):
+        out = self.forward_features(x)
+        if self.pool:
+            out = self.pool(out).squeeze(-1).squeeze(-1)
+        return out
+
+    def forward_features(self, x):
+        out = self.model(x)
+        if isinstance(out, list):
+            assert len(out) == 1
+            out = out[0]
+        return out
+
+
+class CTransPathInferenceEncoder(BasePatchEncoder):
+    def _build(self, **kwargs):
+        from torchvision.transforms import Compose, Resize, InterpolationMode
+        from torch import nn
+
+        try:
+            from slide.tile_encoder.model_zoo.ctranspath.ctran import ctranspath
+        except:
+            traceback.print_exc()
+            raise Exception(
+                "Failed to import CTransPath model, make sure timm_ctp is installed. `pip install timm_ctp`"
+            )
+
+        self.enc_name = "ctranspath"
+        weights_path = get_weights_path("tile", self.enc_name)
+        model = ctranspath(img_size=224)
+        model.head = nn.Identity()
+
+        weights_dir = os.path.dirname(weights_path)
+        os.makedirs(weights_dir, exist_ok=True)
+
+        if not os.path.isfile(weights_path):
+            from huggingface_hub import hf_hub_download
+            import shutil
+
+            downloaded_file_path = hf_hub_download(
+                repo_id="MahmoodLab/hest-bench",
+                repo_type="dataset",
+                filename="CHIEF_CTransPath.pth",
+                subfolder="fm_v1/ctranspath",
+                local_dir=weights_dir,
+            )
+            shutil.move(downloaded_file_path, weights_path)
+            subfolder_path = os.path.join(weights_dir, "fm_v1", "ctranspath")
+            if os.path.exists(subfolder_path):
+                os.removedirs(subfolder_path)
+
+        state_dict = torch.load(weights_path, weights_only=True)["model"]
+        state_dict = {
+            key: val for key, val in state_dict.items() if "attn_mask" not in key
+        }
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        assert (
+            len(unexpected) == 0
+        ), f"Unexpected keys found in state dict: {unexpected}"
+        assert missing == [
+            "layers.0.blocks.1.attn_mask",
+            "layers.1.blocks.1.attn_mask",
+            "layers.2.blocks.1.attn_mask",
+            "layers.2.blocks.3.attn_mask",
+            "layers.2.blocks.5.attn_mask",
+        ], f"Unexpected missing keys: {missing}"
+
+        eval_transform = get_eval_transforms(
+            (0.485, 0.456, 0.406),
+            (0.229, 0.224, 0.225),
+            target_img_size=224,
+            interpolation=InterpolationMode.BILINEAR,
+            max_size=None,
+            antialias=True,
+        )
+
+        precision = torch.float32
+
+        return model, eval_transform, precision
+
+
+class UNIInferenceEncoder(BasePatchEncoder):
+    def _build(
+        self,
+        timm_kwargs={"dynamic_img_size": True, "num_classes": 0, "init_values": 1.0},
+        **kwargs,
+    ):
+        import timm
+        from timm.data import resolve_data_config
+        from timm.data.transforms_factory import create_transform
+
+        self.enc_name = "uni_v1"
+
+        try:
+            print("try to create uni_v1 model")
+            model = timm.create_model(
+                "hf-hub:MahmoodLab/uni", pretrained=True, **timm_kwargs
+            )
+            print("ok")
+        except:
+            traceback.print_exc()
+            raise Exception(
+                "Failed to download UNI model, make sure that you were granted access and that you correctly registered your token"
+            )
+
+        eval_transform = create_transform(
+            **resolve_data_config(model.pretrained_cfg, model=model)
+        )
+        precision = torch.float16
+        return model, eval_transform, precision
+
+
+class UNIv2InferenceEncoder(BasePatchEncoder):
+    def _build(self, **kwargs):
+        import timm
+        from timm.data import resolve_data_config
+        from timm.data.transforms_factory import create_transform
+
+        self.enc_name = "uni_v2"
+
+        timm_kwargs = {
+            "img_size": 224,
+            "patch_size": 14,
+            "depth": 24,
+            "num_heads": 24,
+            "init_values": 1e-5,
+            "embed_dim": 1536,
+            "mlp_ratio": 2.66667 * 2,
+            "num_classes": 0,
+            "no_embed_class": True,
+            "mlp_layer": timm.layers.SwiGLUPacked,
+            "act_layer": torch.nn.SiLU,
+            "reg_tokens": 8,
+            "dynamic_img_size": True,
+        }
+        try:
+            model = timm.create_model(
+                "hf-hub:MahmoodLab/UNI2-h", pretrained=True, **timm_kwargs
+            )
+        except:
+            traceback.print_exc()
+            raise Exception(
+                "Failed to download UNI model, make sure that you were granted access and that you correctly registered your token"
+            )
+
+        eval_transform = create_transform(
+            **resolve_data_config(model.pretrained_cfg, model=model)
+        )
+        precision = torch.bfloat16
+        return model, eval_transform, precision
+
+
+class SealVisionInferenceEncoder(BasePatchEncoder):
+    """
+    Vision encoder fine-tuned with SEAL.
+
+    Loads the official SEAL vision checkpoint using SEAL's own model
+    construction/loading code, preserving the LoRA / PatchRecEncoder
+    structure expected by the checkpoint.
+
+    Output:
+        Tensor of shape [B, 1536]
+    """
+
+    def __init__(self, backbone, **build_kwargs):
+        self.backbone = backbone
+        super().__init__()
+
+    def _build(
+        self,
+        source="auto",
+        hf_repo_id="MahmoodLab/SEAL",
+        hf_revision="main",
+        hf_token=None,
+        cache_dir=None,
+        **kwargs,
+    ):
+        self.enc_name = f"{self.backbone}_seal_vision"
+
+        if hf_token is None:
+            from huggingface_hub import get_token
+            hf_token = get_token()
+
+        try:
+            from external.SEAL.seal import seal_factory
+        except ImportError:
+            traceback.print_exc()
+            raise ImportError(
+                f"SEAL is required for `{self.enc_name}`. "
+                "Install the MahmoodLab/SEAL repository first."
+            )
+
+        try:
+            print(f"backbone = {self.backbone}")
+            (model, eval_transform, precision), _ = seal_factory(
+                backbone=self.backbone,
+                source=source,
+                hf_repo_id=hf_repo_id,
+                hf_revision=hf_revision,
+                hf_token=hf_token,
+                cache_dir=cache_dir,
+            )  # seal_factory also returns a gene_encoder
+        except Exception:
+            traceback.print_exc()
+            raise RuntimeError(
+                "Failed to load the SEAL vision encoder. "
+                "Make sure you have access to MahmoodLab/SEAL on "
+                "Hugging Face and are authenticated."
+            )
+
+        if model is None:
+            raise RuntimeError(
+                f"SEAL did not return a vision model for backbone='{self.backbone}'. "
+                f"Check that the SEAL vision checkpoint is available for backbone='{self.backbone}'."
+            )
+
+        model.eval()
+
+        return model, eval_transform, precision
+
+
+class Conchv1InferenceEncoder(BasePatchEncoder):
+
+    def _build(self, with_proj=False, normalize=False, **kwargs):
+        self.enc_name = "conch_v1"
+        self.with_proj = with_proj
+        self.normalize = normalize
+        try:
+            from conch.open_clip_custom import create_model_from_pretrained
+        except:
+            traceback.print_exc()
+            raise Exception(
+                "Please install CONCH `pip install git+https://github.com/Mahmoodlab/CONCH.git`"
+            )
+
+        try:
+            model, preprocess = create_model_from_pretrained(
+                "conch_ViT-B-16", "hf_hub:MahmoodLab/conch"
+            )
+        except:
+            traceback.print_exc()
+            raise Exception(
+                "Failed to download CONCH model, make sure that you were granted access and that you correctly registered your token"
+            )
+
+        eval_transform = preprocess
+        precision = torch.float32
+
+        return model, eval_transform, precision
+
+    def forward(self, x):
+        return self.model.encode_image(
+            x, proj_contrast=self.with_proj, normalize=self.normalize
+        )
+
+
+class Conchv15InferenceEncoder(BasePatchEncoder):
+    def _build(self, img_size=448, **kwargs):
+
+        from slide.tile_encoder.model_zoo.conchv1_5.conchv1_5 import (
+            create_model_from_pretrained,
+        )
+
+        self.enc_name = "conch_v15"
+        weights_path = get_weights_path("tile", self.enc_name)
+        weights_dir = os.path.dirname(weights_path)
+        os.makedirs(weights_dir, exist_ok=True)
+
+        if os.path.isfile(weights_path):
+            model, eval_transform = create_model_from_pretrained(
+                checkpoint_path=weights_path, img_size=img_size
+            )
+        else:
+            print("Downloading model weights from HuggingFace...")
+            model, eval_transform = create_model_from_pretrained(
+                checkpoint_path="hf_hub:MahmoodLab/conchv1_5", img_size=img_size
+            )
+            torch.save(model.state_dict(), weights_path)
+
+        precision = torch.float16
+        return model, eval_transform, precision
+
+
+class GigaPathInferenceEncoder(BasePatchEncoder):
+    def _build(self, timm_kwargs={}, **kwargs):
+        import timm
+
+        assert (
+            timm.__version__ == "0.9.16"
+        ), f"Gigapath requires timm version 0.9.16, but found {timm.__version__}. Please install the correct version using `pip install timm==0.9.16`"
+        from torchvision import transforms
+
+        self.enc_name = "prov_gigapath"
+
+        model = timm.create_model(
+            "hf_hub:prov-gigapath/prov-gigapath", pretrained=True, **timm_kwargs
+        )
+
+        eval_transform = transforms.Compose(
+            [
+                transforms.Resize(
+                    256, interpolation=transforms.InterpolationMode.BICUBIC
+                ),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)
+                ),
+            ]
+        )
+        precision = torch.float32
+        return model, eval_transform, precision
+
+
+class VirchowInferenceEncoder(BasePatchEncoder):
+    import timm
+
+    def _build(
+        self,
+        return_cls=False,
+        timm_kwargs={"mlp_layer": timm.layers.SwiGLUPacked, "act_layer": torch.nn.SiLU},
+        **kwargs,
+    ):
+        import timm
+        from timm.data import resolve_data_config
+        from timm.data.transforms_factory import create_transform
+
+        self.enc_name = "virchow"
+
+        model = timm.create_model(
+            "hf-hub:paige-ai/Virchow", pretrained=True, **timm_kwargs
+        )
+        eval_transform = create_transform(
+            **resolve_data_config(model.pretrained_cfg, model=model)
+        )
+        precision = torch.float16
+        self.return_cls = return_cls
+
+        return model, eval_transform, precision
+
+    def forward(self, x):
+        output = self.model(x)
+        class_token = output[:, 0]
+
+        if self.return_cls:
+            return class_token
+        else:
+            patch_tokens = output[:, 1:]
+            embeddings = torch.cat([class_token, patch_tokens.mean(1)], dim=-1)
+            return embeddings
+
+
+class Virchow2InferenceEncoder(BasePatchEncoder):
+    import timm
+
+    def _build(
+        self,
+        return_cls=False,
+        timm_kwargs={"mlp_layer": timm.layers.SwiGLUPacked, "act_layer": torch.nn.SiLU},
+        **kwargs,
+    ):
+        import timm
+        from timm.data import resolve_data_config
+        from timm.data.transforms_factory import create_transform
+
+        self.enc_name = "virchow2"
+
+        model = timm.create_model(
+            "hf-hub:paige-ai/Virchow2", pretrained=True, **timm_kwargs
+        )
+        eval_transform = create_transform(
+            **resolve_data_config(model.pretrained_cfg, model=model)
+        )
+        precision = torch.float16
+        self.return_cls = return_cls
+
+        return model, eval_transform, precision
+
+    def forward(self, x):
+        output = self.model(x)
+
+        class_token = output[:, 0]
+        if self.return_cls:
+            return class_token
+
+        patch_tokens = output[:, 5:]
+        embedding = torch.cat([class_token, patch_tokens.mean(1)], dim=-1)
+        return embedding
+
+
+class HOptimus0InferenceEncoder(BasePatchEncoder):
+
+    def _build(
+        self, timm_kwargs={"init_values": 1e-5, "dynamic_img_size": False}, **kwargs
+    ):
+        import timm
+
+        assert (
+            timm.__version__ == "0.9.16"
+        ), f"H-Optimus requires timm version 0.9.16, but found {timm.__version__}. Please install the correct version using `pip install timm==0.9.16`"
+        from torchvision import transforms
+
+        self.enc_name = "hoptimus0"
+
+        model = timm.create_model(
+            "hf-hub:bioptimus/H-optimus-0", pretrained=True, **timm_kwargs
+        )
+
+        eval_transform = transforms.Compose(
+            [
+                transforms.Resize(224),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=(0.707223, 0.578729, 0.703617),
+                    std=(0.211883, 0.230117, 0.177517),
+                ),
+            ]
+        )
+
+        precision = torch.float16
+        return model, eval_transform, precision
+
+
+class H0MiniInferenceEncoder(BasePatchEncoder):
+
+    def _build(
+        self,
+        timm_kwargs={"mlp_layer": timm.layers.SwiGLUPacked, "act_layer": torch.nn.SiLU},
+        **kwargs,
+    ):
+        import timm
+        from timm.data import resolve_data_config
+        from timm.data.transforms_factory import create_transform
+
+        self.enc_name = "h0mini"
+
+        model = timm.create_model(
+            "hf-hub:bioptimus/H0-mini", pretrained=True, **timm_kwargs
+        )
+        eval_transform = create_transform(
+            **resolve_data_config(model.pretrained_cfg, model=model)
+        )
+
+        precision = torch.float32
+        return model, eval_transform, precision
+
+
+class HOptimus1InferenceEncoder(BasePatchEncoder):
+
+    def _build(
+        self, timm_kwargs={"init_values": 1e-5, "dynamic_img_size": False}, **kwargs
+    ):
+        import timm
+        from torchvision import transforms
+
+        self.enc_name = "hoptimus1"
+
+        model = timm.create_model(
+            "hf-hub:bioptimus/H-optimus-1", pretrained=True, **timm_kwargs
+        )
+
+        eval_transform = transforms.Compose(
+            [
+                transforms.Resize(224),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=(0.707223, 0.578729, 0.703617),
+                    std=(0.211883, 0.230117, 0.177517),
+                ),
+            ]
+        )
+
+        precision = torch.float16
+        return model, eval_transform, precision
+
+
+class PROiFHESiH1InferenceEncoder(BasePatchEncoder):
+
+    def _build(self, **kwargs):
+        from slide.tile_encoder.model_zoo.PROiFHESi_H1.model import (
+            HESingIF,  # to change name
+            load_model_from_path,
+        )
+
+        self.device = (
+            kwargs.get("device", "cuda")
+            if torch.cuda.is_available()
+            else kwargs.get("device", "cpu")
+        )
+        self.how = kwargs.get("embeddings", False)
+        model_path = get_model_path("tile", "PROiFHESi_H1")
+        # use load_model_from_path?
+        model = load_model_from_path(model_path=model_path, device=self.device)
+        network = model.network
+
+        if self.how:
+            self.enc_name = "PROiFHESi_H1_emb"
+            return network.backbone, network.transform, network.precision["backbone"]
+        else:
+            self.enc_name = "PROiFHESi_H1_out"
+            return network, network.transform, model.precision["backbone"]
+
+
+class PhikonInferenceEncoder(BasePatchEncoder):
+    def _build(self, **kwargs):
+
+        from transformers import ViTModel
+        from torchvision.transforms import Compose, Resize, InterpolationMode
+
+        self.enc_name = "phikon"
+        weights_path = get_weights_path("tile", self.enc_name)
+
+        if os.path.exists(weights_path):
+            model = ViTModel.from_pretrained(weights_path, add_pooling_layer=False)
+        else:
+            model = ViTModel.from_pretrained("owkin/phikon", add_pooling_layer=False)
+            os.makedirs(weights_path, exist_ok=True)
+            model.save_pretrained(weights_path)
+        eval_transform = get_eval_transforms(
+            (0.485, 0.456, 0.406),
+            (0.229, 0.224, 0.225),
+            target_img_size=224,
+            interpolation=InterpolationMode.BILINEAR,
+            max_size=None,
+            antialias=True,
+        )
+        precision = torch.float32
+        return model, eval_transform, precision
+
+    def forward(self, x):
+        out = self.forward_features(x)
+        out = out.last_hidden_state[:, 0, :]
+        return out
+
+    def forward_features(self, x):
+        out = self.model(pixel_values=x)
+        return out
+
+
+class Phikonv2InferenceEncoder(BasePatchEncoder):
+    def _build(self, **kwargs):
+
+        from transformers import AutoModel
+        import torchvision.transforms as T
+
+        self.enc_name = "phikon_v2"
+        weights_path = get_weights_path("tile", self.enc_name)
+
+        if os.path.exists(weights_path):
+            model = AutoModel.from_pretrained(weights_path)
+        else:
+            model = AutoModel.from_pretrained("owkin/phikon-v2")
+            os.makedirs(weights_path, exist_ok=True)
+            model.save_pretrained(weights_path)
+
+        eval_transform = T.Compose(
+            [
+                T.Resize(224),
+                T.CenterCrop(224),
+                T.ToTensor(),
+                T.Normalize(
+                    mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)
+                ),  # Normalize with specified mean and std
+            ]
+        )
+
+        precision = torch.float32
+        return model, eval_transform, precision
+
+    def forward(self, x):
+        out = self.model(x)
+        out = out.last_hidden_state[:, 0, :]
+        return out
+
+
+class MuskInferenceEncoder(BasePatchEncoder):
+
+    def _build(
+        self,
+        inference_aug=False,
+        with_proj=False,
+        out_norm=False,
+        return_global=True,
+        **kwargs,
+    ):
+        """
+        Args:
+            inference_aug (bool): Whether to use test-time multiscale augmentation. Default is False to allow for fair comparison with other models.
+        """
+        self.enc_name = "musk"
+        self.inference_aug = inference_aug
+        self.with_proj = with_proj
+        self.out_norm = out_norm
+        self.return_global = return_global
+
+        try:
+            from musk import utils, modeling
+        except:
+            traceback.print_exc()
+            raise Exception(
+                "Please install MUSK `pip install fairscale git+https://github.com/lilab-stanford/MUSK`"
+            )
+
+        try:
+            from timm.models import create_model
+
+            model = create_model("musk_large_patch16_384")
+            utils.load_model_and_may_interpolate(
+                "hf_hub:xiangjx/musk", model, "model|module", ""
+            )
+        except:
+            traceback.print_exc()
+            raise Exception(
+                "Failed to download MUSK model, make sure that you were granted access and that you correctly registered your token"
+            )
+
+        from timm.data.constants import IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
+        from torchvision.transforms import Compose, Resize, InterpolationMode
+
+        eval_transform = get_eval_transforms(
+            IMAGENET_INCEPTION_MEAN,
+            IMAGENET_INCEPTION_STD,
+            target_img_size=384,
+            center_crop=True,
+            interpolation=InterpolationMode.BICUBIC,
+            antialias=True,
+        )
+        precision = torch.float16
+
+        return model, eval_transform, precision
+
+    def forward(self, x):
+        return self.model(
+            image=x,
+            with_head=self.with_proj,
+            out_norm=self.out_norm,
+            ms_aug=self.inference_aug,
+            return_global=self.return_global,
+        )[
+            0
+        ]  # Forward pass yields (vision_cls, text_cls). We only need vision_cls.
+
+
+def get_eval_transforms(
+    mean, std, target_img_size=-1, center_crop=False, **resize_kwargs
+):
+
+    from torchvision import transforms
+
+    tforms = []
+
+    if target_img_size > 0:
+        tforms.append(transforms.Resize(target_img_size, **resize_kwargs))
+    if center_crop:
+        assert target_img_size > 0, "target_img_size must be set if center_crop is True"
+        tforms.append(transforms.CenterCrop(target_img_size))
+
+    tforms.append(transforms.ToTensor())
+    if mean is not None and std is not None:
+        tforms.append(transforms.Normalize(mean, std))
+    tforms = transforms.Compose(tforms)
+
+    return tforms

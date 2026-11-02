@@ -3,6 +3,17 @@ slide/local_patch_encoder/model_zoo/conchv1_5/pytorch_model_vision.bin
 slide/local_patch_encoder/model_zoo/ctranspath/CHIEF_CTransPath.pth
 slide/local_patch_encoder/model_zoo/phikon/model.safetensors
 slide/local_patch_encoder/model_zoo/phikon_v2/model.safetensors
+*.npy
+*.h5
+
+# ml model
+*.pt.tar
+*.pth
+*.safetensors
+*.bin
+
+# event files
+events.*
 
 # mac os
 .DS_Store
